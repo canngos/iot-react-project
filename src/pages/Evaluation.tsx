@@ -6,10 +6,11 @@ import { useSettings } from '../hooks/useSettingsData';
 import { Line } from 'react-chartjs-2';
 import {
     Container, Grid, Card, CardContent, Typography, TextField, Button,
-    Box, Divider, Chip, Stack, CircularProgress, useTheme
+    Box, Divider, Chip, Stack, CircularProgress, useTheme, LinearProgress
 } from '@mui/material';
-import ReplayIcon from '@mui/icons-material/Replay';
 import CloudQueueIcon from '@mui/icons-material/CloudQueue';
+import PlayArrowIcon from '@mui/icons-material/PlayArrow';
+import AssessmentIcon from '@mui/icons-material/Assessment';
 import SpeedIcon from '@mui/icons-material/Speed';
 import TimerIcon from '@mui/icons-material/Timer';
 import {
@@ -20,67 +21,97 @@ import {
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
 const DEFAULT_READ_INTERVAL = 2;
+const TEST_DURATION_MS = 60000; // 60 Seconds exactly
 
 const Evaluation: React.FC = () => {
     const theme = useTheme();
-    const { mqttHistory, isConnected, clearData } = useMqttData(100); // Increased buffer to 100 for better graph
+    const { mqttHistory, isConnected, clearData } = useMqttData(100);
     const { readInterval } = useSettings();
 
     const [targetInterval, setTargetInterval] = useState<number>(DEFAULT_READ_INTERVAL);
     const [isSaving, setIsSaving] = useState(false);
 
-    // --- SESSION STATE (Resets when interval changes) ---
-    const [sessionCount, setSessionCount] = useState(0);
-    const [sessionStartTime, setSessionStartTime] = useState(Date.now());
-    const [currentInterval, setCurrentInterval] = useState(DEFAULT_READ_INTERVAL);
+    // --- TEST SESSION STATE ---
+    const [isTestRunning, setIsTestRunning] = useState(false);
+    const [timeLeft, setTimeLeft] = useState(0);
+    const [testMessageCount, setTestMessageCount] = useState(0);
+    const [finalResult, setFinalResult] = useState<number | null>(null);
 
-    // We use a Ref to track the last processed message ID to avoid double-counting
-    const lastProcessedMsgId = useRef<number | null>(null);
+    // REFS FOR ACCURATE TIMING
+    const testEndTimeRef = useRef<number>(0);
+    const lastTestMsgId = useRef<number | null>(null);
 
-    // --- LOGIC: RESET SESSION ON INTERVAL CHANGE ---
+    // --- EFFECT: ACCURATE TIMER LOGIC ---
     useEffect(() => {
-        if (mqttHistory.length > 0) {
-            const latestPacket = mqttHistory[0];
-            const packetInterval = latestPacket.interval || DEFAULT_READ_INTERVAL;
+        let interval: NodeJS.Timeout;
 
-            // If the incoming packet has a different interval than our current session
-            // It means the Pico has accepted the new setting. RESET!
-            if (packetInterval !== currentInterval) {
-                console.log("New Scenario Detected! Resetting Counters.");
-                setCurrentInterval(packetInterval);
-                setSessionCount(1); // Start at 1
-                setSessionStartTime(Date.now());
-                lastProcessedMsgId.current = latestPacket.msg_id;
-            }
-            // Normal counting logic
-            else if (latestPacket.msg_id !== lastProcessedMsgId.current) {
-                setSessionCount(prev => prev + 1);
-                lastProcessedMsgId.current = latestPacket.msg_id;
+        if (isTestRunning) {
+            interval = setInterval(() => {
+                const now = Date.now();
+                const end = testEndTimeRef.current;
+
+                // Calculate remaining seconds based on REAL TIME, not ticks
+                const remaining = Math.ceil((end - now) / 1000);
+
+                if (remaining <= 0) {
+                    // Test Finished exactly when real time is up
+                    setTimeLeft(0);
+                    setIsTestRunning(false);
+                    // We need to capture the count one last time here to be safe
+                    // But since state updates are async, we rely on the effect below to stop counting
+                } else {
+                    setTimeLeft(remaining);
+                }
+            }, 100); // Check every 100ms to keep UI snappy
+        } else if (!isTestRunning && timeLeft === 0 && testEndTimeRef.current !== 0) {
+            // Test just finished, save result
+            setFinalResult(testMessageCount);
+            testEndTimeRef.current = 0; // Reset ref so we don't save again
+        }
+
+        return () => clearInterval(interval);
+    }, [isTestRunning, testMessageCount]);
+
+    // --- EFFECT: COUNT MESSAGES DURING TEST ---
+    useEffect(() => {
+        if (isTestRunning && mqttHistory.length > 0) {
+            const latestPacket = mqttHistory[0];
+            // Only count if it's a new message
+            if (latestPacket.msg_id !== lastTestMsgId.current) {
+                setTestMessageCount(prev => prev + 1);
+                lastTestMsgId.current = latestPacket.msg_id;
             }
         }
-    }, [mqttHistory, currentInterval]);
-
+    }, [mqttHistory, isTestRunning]);
 
     // --- CALCULATE LATENCY (Jitter) ---
     const latencyData = useMemo(() => {
         if (mqttHistory.length < 2) return [];
-
-        // Calculate time difference between consecutive packets
-        // Since history is New -> Old, we iterate backwards
         const latencies = [];
         for (let i = 0; i < mqttHistory.length - 1; i++) {
-            const current = mqttHistory[i]; // Newest
-            const previous = mqttHistory[i+1]; // Older
-
+            const current = mqttHistory[i];
+            const previous = mqttHistory[i+1];
             const diff = current.timestamp - previous.timestamp;
             latencies.push(diff);
         }
-        return latencies.reverse(); // Old -> New for graph
+        return latencies.reverse();
     }, [mqttHistory]);
 
     const avgLatency = latencyData.length > 0
         ? (latencyData.reduce((a, b) => a + b, 0) / latencyData.length).toFixed(0)
         : "0";
+
+    // --- HANDLERS ---
+    const handleStartTest = () => {
+        // Set the end time to exactly NOW + 60000ms
+        testEndTimeRef.current = Date.now() + TEST_DURATION_MS;
+
+        setIsTestRunning(true);
+        setTimeLeft(60);
+        setTestMessageCount(0);
+        setFinalResult(null);
+        lastTestMsgId.current = mqttHistory[0]?.msg_id || null;
+    };
 
     const handleUpdateInterval = async () => {
         setIsSaving(true);
@@ -92,43 +123,18 @@ const Evaluation: React.FC = () => {
     const handleResetDefaults = async () => {
         setIsSaving(true);
         try {
-            // 1. Reset Firebase Setting
             await update(ref(db, 'settings'), { read_interval: DEFAULT_READ_INTERVAL });
-
-            // 2. Reset Local Input State
             setTargetInterval(DEFAULT_READ_INTERVAL);
-
-            // 3. Reset Session Counters (Throughput)
-            setSessionCount(0);
-            setSessionStartTime(Date.now());
-
-            // 4. Clear the Graph (The new function)
+            setIsTestRunning(false);
+            setTimeLeft(0);
+            setTestMessageCount(0);
+            setFinalResult(null);
+            testEndTimeRef.current = 0;
             clearData();
-
-        } catch (e) {
-            console.error(e);
-        } finally {
-            setIsSaving(false);
-        }
+        } catch (e) { console.error(e); } finally { setIsSaving(false); }
     };
 
-    // --- CHART 1: THROUGHPUT (Accumulated Messages) ---
-    // We want to show a slope. Steep slope = High Throughput.
-    const throughputChartData = {
-        labels: Array.from({length: sessionCount}, (_, i) => i + 1), // 1, 2, 3...
-        datasets: [
-            {
-                label: 'Total Messages Received (Current Scenario)',
-                data: Array.from({length: sessionCount}, (_, i) => i + 1), // Linear growth
-                borderColor: theme.palette.primary.main,
-                backgroundColor: theme.palette.primary.light,
-                fill: true,
-                tension: 0,
-            },
-        ],
-    };
-
-    // --- CHART 2: LATENCY (Inter-arrival Time) ---
+    // --- CHARTS ---
     const latencyChartData = {
         labels: latencyData.map((_, i) => i.toString()),
         datasets: [
@@ -143,9 +149,9 @@ const Evaluation: React.FC = () => {
             },
             {
                 label: 'Expected Interval',
-                data: latencyData.map(() => currentInterval * 1000),
+                data: latencyData.map(() => (readInterval || 2) * 1000),
                 borderColor: theme.palette.error.main,
-                borderDash: [5, 5], // Dashed line
+                borderDash: [5, 5],
                 pointRadius: 0,
                 borderWidth: 1
             }
@@ -160,7 +166,6 @@ const Evaluation: React.FC = () => {
             </Stack>
 
             <Grid container spacing={3}>
-                {/* CONFIGURATION PANEL */}
                 <Grid size={{ xs: 12, md: 4 }}>
                     <Card variant="outlined" sx={{ height: '100%' }}>
                         <CardContent>
@@ -174,65 +179,95 @@ const Evaluation: React.FC = () => {
                                     onChange={(e) => setTargetInterval(Number(e.target.value))}
                                     helperText={`Projected: ${(60 / (targetInterval || 1)).toFixed(1)} msgs/min`}
                                 />
-                                <Stack direction="row" spacing={1} sx={{ mt: 2 }}>
-                                    <Button variant="contained" fullWidth onClick={handleUpdateInterval} disabled={isSaving}>
-                                        {isSaving ? <CircularProgress size={20} /> : 'Apply'}
+                                <Stack spacing={2} sx={{ mt: 2 }}>
+                                    <Stack direction="row" spacing={1}>
+                                        <Button variant="contained" fullWidth onClick={handleUpdateInterval} disabled={isSaving || isTestRunning}>
+                                            {isSaving ? <CircularProgress size={20} /> : 'Apply'}
+                                        </Button>
+                                        <Button variant="outlined" onClick={handleResetDefaults} disabled={isSaving || isTestRunning}>
+                                            Reset
+                                        </Button>
+                                    </Stack>
+
+                                    <Divider>MEASUREMENT</Divider>
+
+                                    <Button
+                                        variant="contained"
+                                        color="secondary"
+                                        size="large"
+                                        startIcon={isTestRunning ? <CircularProgress size={20} color="inherit"/> : <PlayArrowIcon />}
+                                        onClick={handleStartTest}
+                                        disabled={isTestRunning || !isConnected}
+                                    >
+                                        {isTestRunning ? `Testing... ${timeLeft}s` : "Start 1-Min Counter"}
                                     </Button>
-                                    <Button variant="outlined" onClick={handleResetDefaults} disabled={isSaving}>
-                                        Reset
-                                    </Button>
+
+                                    {isTestRunning && (
+                                        <LinearProgress variant="determinate" value={((60 - timeLeft) / 60) * 100} color="secondary" />
+                                    )}
                                 </Stack>
                             </Box>
-                            <Divider sx={{ my: 2 }} />
-                            <Stack direction="row" justifyContent="space-between">
-                                <Typography color="text.secondary">Active Interval:</Typography>
-                                <Typography fontWeight="bold">{currentInterval}s</Typography>
-                            </Stack>
                         </CardContent>
                     </Card>
                 </Grid>
 
-                {/* METRICS PANEL */}
                 <Grid size={{ xs: 12, md: 8 }}>
                     <Grid container spacing={2}>
-                        {/* CARD: THROUGHPUT */}
-                        <Grid size={{ xs: 12, sm: 6 }}>
-                            <Card sx={{ bgcolor: theme.palette.primary.light, color: 'white' }}>
+                        <Grid size={{ xs: 12, sm: 4 }}>
+                            <Card sx={{ bgcolor: theme.palette.primary.light, color: 'white', height: '100%' }}>
                                 <CardContent>
                                     <Stack direction="row" alignItems="center" spacing={1}>
                                         <SpeedIcon />
-                                        <Typography variant="h6">Throughput</Typography>
+                                        <Typography variant="subtitle1">Throughput</Typography>
                                     </Stack>
-                                    <Typography variant="h3" fontWeight="bold" sx={{ mt: 2 }}>
-                                        {sessionCount}
+                                    <Typography variant="h3" fontWeight="bold" sx={{ mt: 1 }}>
+                                        {mqttHistory.length}
                                     </Typography>
-                                    <Typography variant="body2" sx={{ opacity: 0.9 }}>
-                                        Messages in current session
+                                    <Typography variant="caption">Buffered Packets</Typography>
+                                </CardContent>
+                            </Card>
+                        </Grid>
+
+                        <Grid size={{ xs: 12, sm: 4 }}>
+                            <Card sx={{ bgcolor: isTestRunning ? theme.palette.secondary.main : (finalResult ? theme.palette.success.light : '#e0e0e0'), color: 'white', height: '100%' }}>
+                                <CardContent>
+                                    <Stack direction="row" alignItems="center" spacing={1}>
+                                        <AssessmentIcon />
+                                        <Typography variant="subtitle1">Actual (1 min)</Typography>
+                                    </Stack>
+                                    {isTestRunning ? (
+                                        <Typography variant="h3" fontWeight="bold" sx={{ mt: 1 }}>
+                                            {testMessageCount}
+                                        </Typography>
+                                    ) : (
+                                        <Typography variant="h3" fontWeight="bold" sx={{ mt: 1 }}>
+                                            {finalResult !== null ? finalResult : "--"}
+                                        </Typography>
+                                    )}
+                                    <Typography variant="caption">
+                                        {isTestRunning ? "Counting..." : "msgs / minute"}
                                     </Typography>
                                 </CardContent>
                             </Card>
                         </Grid>
-                        {/* CARD: LATENCY */}
-                        <Grid size={{ xs: 12, sm: 6 }}>
-                            <Card sx={{ bgcolor: '#ff9f40', color: 'white' }}>
+
+                        <Grid size={{ xs: 12, sm: 4 }}>
+                            <Card sx={{ bgcolor: '#ff9f40', color: 'white', height: '100%' }}>
                                 <CardContent>
                                     <Stack direction="row" alignItems="center" spacing={1}>
                                         <TimerIcon />
-                                        <Typography variant="h6">Avg Latency</Typography>
+                                        <Typography variant="subtitle1">Avg Latency</Typography>
                                     </Stack>
-                                    <Typography variant="h3" fontWeight="bold" sx={{ mt: 2 }}>
+                                    <Typography variant="h3" fontWeight="bold" sx={{ mt: 1 }}>
                                         {avgLatency}<span style={{fontSize: '1rem'}}>ms</span>
                                     </Typography>
-                                    <Typography variant="body2" sx={{ opacity: 0.9 }}>
-                                        Inter-arrival time (Avg)
-                                    </Typography>
+                                    <Typography variant="caption">Inter-arrival deviation</Typography>
                                 </CardContent>
                             </Card>
                         </Grid>
                     </Grid>
 
-                    {/* GRAPHS */}
-                    <Box sx={{ mt: 2 }}>
+                    <Box sx={{ mt: 3 }}>
                         <Card variant="outlined">
                             <CardContent>
                                 <Typography variant="h6" gutterBottom>Network Stability (Latency)</Typography>
